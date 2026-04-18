@@ -1,0 +1,90 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Texting Decoder — What your texts say about you</title>
+  <meta name="description" content="Reply to six texts. Get your texting archetype. Screenshot it.">
+  <meta property="og:title" content="Texting Decoder">
+  <meta property="og:description" content="Reply to six texts. Get your texting archetype. Screenshot it.">
+  <meta property="og:type" content="website">
+  <meta property="og:url" content="">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Archivo+Black&family=DM+Sans:wght@400;500;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="style.css">
+  <script src="app.js" defer></script>
+  <script src="feedback.js" defer></script>
+</head>
+<body>
+  <main id="app">
+    <!-- Intro screen -->
+    <section id="intro" class="screen">
+      <p class="eyebrow">a reading of your thumbs</p>
+      <h1 class="title">Texting<br>Decoder</h1>
+      <p class="lede">Reply to six texts the way you actually would. We'll tell you what your thumbs reveal.</p>
+      <button id="start-btn" class="primary-btn">Start the decoding →</button>
+      <p class="disclaimer">Nothing you type leaves your phone. Promise.</p>
+    </section>
+
+    <!-- Quiz screen -->
+    <section id="quiz" class="screen hidden">
+      <div class="progress">
+        <span id="progress-label">Text 1 of 6</span>
+        <div class="progress-track"><div id="progress-bar"></div></div>
+      </div>
+
+      <div class="chat-thread">
+        <div class="bubble incoming" id="prompt-bubble">
+          <span class="sender-name" id="sender-name"></span>
+          <span class="bubble-text" id="prompt-text"></span>
+        </div>
+      </div>
+
+      <form id="reply-form" class="reply-row" autocomplete="off">
+        <input
+          id="reply-input"
+          type="text"
+          inputmode="text"
+          autocomplete="off"
+          autocapitalize="sentences"
+          spellcheck="false"
+          maxlength="140"
+          placeholder="type your reply…"
+          required>
+        <button type="submit" id="send-btn" aria-label="Send reply">↑</button>
+      </form>
+      <p id="error-msg" class="error hidden"></p>
+    </section>
+
+    <!-- Loading screen -->
+    <section id="loading" class="screen hidden">
+      <div class="typing-bubble">
+        <span></span><span></span><span></span>
+      </div>
+      <p class="loading-copy" id="loading-copy">reading between the periods…</p>
+    </section>
+
+    <!-- Result screen -->
+    <section id="result" class="screen hidden">
+      <div class="result-card" id="result-card">
+        <p class="result-eyebrow">your texting archetype</p>
+        <h2 class="archetype-name" id="archetype-name"></h2>
+        <p class="archetype-tag" id="archetype-tag"></p>
+
+        <div class="result-columns">
+          <div class="result-thread" id="result-thread"></div>
+          <div class="result-tells" id="result-tells"></div>
+        </div>
+
+        <p class="result-footer">texting-decoder.app</p>
+      </div>
+
+      <div id="share" class="actions">
+        <button onclick="share()" class="primary-btn">Share your archetype</button>
+        <button id="retry-btn" class="ghost-btn">Try again</button>
+      </div>
+    </section>
+  </main>
+</body>
+</html>
