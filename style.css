@@ -208,10 +208,54 @@ body::before {
 
 .chat-thread {
   min-height: 160px;
-  margin: 32px 0 28px;
+  margin: 24px 0 28px;
   display: flex;
   flex-direction: column;
   gap: 10px;
+}
+
+/* Thread header — frames the active chat as ONE conversation with ONE sender,
+   so the user doesn't feel like everything is melded into a single stream. */
+.thread-header {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 14px;
+  background: #fff;
+  border: 2px solid var(--edge);
+  border-radius: 16px;
+  box-shadow: 3px 3px 0 var(--edge);
+  margin-bottom: 6px;
+}
+.thread-header .thread-avatar {
+  width: 28px;
+  height: 28px;
+  border-radius: 50%;
+  background: linear-gradient(135deg, var(--bubble-out-a), var(--bubble-out-b));
+  border: 1.5px solid var(--edge);
+  flex-shrink: 0;
+}
+.thread-header .thread-sender {
+  flex: 1;
+  font-weight: 700;
+  font-size: 14px;
+  color: var(--ink);
+  text-transform: lowercase;
+  letter-spacing: 0.01em;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.thread-header .thread-meta {
+  font-size: 11px;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: var(--muted);
+  flex-shrink: 0;
+}
+.bubble.incoming.typing .bubble-text {
+  color: var(--muted);
+  font-style: italic;
 }
 
 /* Prior turns in the live quiz thread — slightly smaller so the current
@@ -438,13 +482,35 @@ body::before {
 .result-thread {
   display: flex;
   flex-direction: column;
-  gap: 8px;
+  gap: 14px;
 }
 .result-thread .bubble {
   font-size: 15px;
   padding: 10px 14px;
   box-shadow: 2px 2px 0 var(--edge);
   max-width: 100%;
+}
+
+/* Each thread renders as its own bordered card so the share screenshot
+   shows four distinct DMs rather than one meld. */
+.result-thread-block {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 10px 12px;
+  border: 1.5px solid var(--edge);
+  border-radius: 14px;
+  background: var(--paper);
+}
+.result-thread-header {
+  font-size: 11px;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: var(--muted);
+  font-weight: 700;
+  padding: 2px 2px 6px;
+  border-bottom: 1px dashed var(--edge);
+  margin-bottom: 4px;
 }
 
 .result-tells {

@@ -1,17 +1,22 @@
-// Texting Decoder — reply to six texts, get your archetype.
-// Now fully AI-driven: the INCOMING texts are generated on the fly based on your
-// previous replies, so the "chat thread" feels like a real conversation that
-// evolves with your tone. The final archetype read is also AI-generated.
-// Uses the shared ef-ai-proxy. Falls back to deterministic local paths if the
-// proxy fails so the app never breaks.
+// Texting Decoder — swipe through a handful of texting threads, get your archetype.
+// Each "thread" is its OWN conversation with ONE sender. You see up to 3 texts
+// in that thread (the sender can keep going if the chat is alive, or bail early
+// if it dies), then you move to the NEXT sender's thread. Four senders total.
+// This structure fixes the old confusion of all senders bleeding into a single
+// phone-shaped thread: now it reads like flipping through separate DMs.
+//
+// Uses the shared ef-ai-proxy for both turn-by-turn text generation and final
+// archetype read. Falls back to deterministic local paths if the proxy fails
+// so the app never breaks.
 
 const AI_ENDPOINT = 'https://uy3l6suz07.execute-api.us-east-1.amazonaws.com/ai';
 const SLUG = 'texting-decoder';
-const NUM_PROMPTS = 6;
+const NUM_THREADS = 4;         // four distinct conversations / senders
+const MAX_TURNS_PER_THREAD = 3;// at most three incoming texts per sender
 
-// A small bank of possible "senders" the AI can pick from when generating the
-// next incoming text. This keeps the cast diverse and weirdly specific — the
-// thing that makes the screenshot funny.
+// A small bank of possible "senders" the AI can pick from when opening a new
+// thread. Keeps the cast diverse and weirdly specific — the thing that makes
+// the screenshot funny.
 const SENDER_BANK = [
   "someone you half-know",
   "your roommate",
@@ -32,8 +37,9 @@ const SENDER_BANK = [
   "a matched dating app chat",
 ];
 
-// Deterministic opener — always the same first message so the UX has a clean
-// start. The AI takes over from message 2 onward, reacting to your replies.
+// Deterministic opener — always the same first conversation so the UX has a
+// clean start. The AI takes over from the second message in this thread and
+// for every subsequent thread.
 const OPENER = { sender: "someone you half-know", text: "hey wyd" };
 
 const LOADING_MSGS = [
@@ -49,8 +55,7 @@ const LOADING_MSGS = [
 const TYPING_MSGS = [
   "they're typing…",
   "…",
-  "new thread incoming…",
-  "another one's coming in…",
+  "another message coming in…",
   "thumb activity detected…",
 ];
 
@@ -171,14 +176,22 @@ const FALLBACK_ARCHETYPES = [
   { name: "The Third-Screen Oracle",        tag: "replies as if reading from a book no one else can see. we trust you anyway." },
 ];
 
-// Offline fallback prompts — only used if the AI-prompt-generation call fails.
-// These guarantee the quiz always advances to six even with no network.
-const FALLBACK_PROMPTS = [
-  { sender: "your roommate",               text: "did u eat" },
-  { sender: "your situationship, unprompted", text: "been thinking about u lately" },
-  { sender: "a friend, 11:47pm",           text: "my week has been the worst" },
-  { sender: "the group chat",              text: "we still on for saturday??" },
-  { sender: "your ex, randomly",           text: "saw something that reminded me of u" },
+// Offline fallback thread openers — only used if the AI-prompt-generation call
+// fails. These guarantee the quiz always advances even with no network.
+const FALLBACK_THREAD_OPENERS = [
+  { sender: "your roommate",                   text: "did u eat or am i making enough for both" },
+  { sender: "your situationship, unprompted",  text: "been thinking about u lately. weird of me?" },
+  { sender: "a friend, 11:47pm",               text: "my week has been the worst and i don't know where to start" },
+  { sender: "the group chat",                  text: "we still on for saturday?? someone confirm because i'm spiraling" },
+  { sender: "your ex, randomly",               text: "saw something that reminded me of u. no pressure to respond" },
+];
+
+// Offline fallback follow-ups inside a single thread (used when the AI fails
+// mid-thread). Generic enough to feel like any sender doubling back.
+const FALLBACK_THREAD_FOLLOWUPS = [
+  "wait — actually what does that even mean lol",
+  "ok but be real with me for a sec",
+  "ok so i'm overthinking this — tell me what you'd do",
 ];
 
 // ---- feature extraction ----
@@ -222,10 +235,24 @@ function analyzeReply(s) {
   };
 }
 
-function aggregate(history) {
-  // `history` here is the list of turn objects; we only analyze replies that
-  // weren't skipped, and keep skipped ones as their own signal.
-  const turns = history.map(h => (typeof h === "string" ? { reply: h, skipped: false } : h));
+// Flatten the thread structure into one linear list of turns for feature
+// extraction. A "turn" is one incoming text + the user's reply (or skip).
+function flattenTurns(threads) {
+  const out = [];
+  threads.forEach(t => {
+    t.turns.forEach(turn => {
+      out.push({
+        sender: t.sender,
+        text: turn.text,
+        reply: turn.reply || "",
+        skipped: !!turn.skipped,
+      });
+    });
+  });
+  return out;
+}
+
+function aggregate(turns) {
   const answered = turns.filter(t => !t.skipped && t.reply);
   const per = answered.map(t => analyzeReply(t.reply));
   const skippedCount = turns.filter(t => t.skipped).length;
@@ -237,6 +264,7 @@ function aggregate(history) {
     perReply:          per,
     skippedCount,
     answeredCount:     per.length,
+    totalTurns:        turns.length,
     emojiTotal:        sum("emoji"),
     ellipsisTotal:     sum("ellipsis"),
     abbrevTotal:       sum("abbrev"),
@@ -258,20 +286,21 @@ function aggregate(history) {
   };
 }
 
-// Extra ghost-mode archetype for people who skip most of the thread.
+// Extra ghost-mode archetype for people who skip most of the threads.
 const GHOST_ARCHETYPE = {
   name: "The Read-Receipt Ghost",
-  tag: "believes not replying is a reply. left four texts on 'delivered' and slept great.",
+  tag: "believes not replying is a reply. left four threads on 'delivered' and slept great.",
 };
 
-function pickArchetypeLocal(history) {
+function pickArchetypeLocal(threads) {
   // Deterministic offline fallback — used only if the AI call fails.
-  const turns = history.map(h => (typeof h === "string" ? { reply: h, skipped: false } : h));
+  const turns = flattenTurns(threads);
   const f = aggregate(turns);
   const seed = hash(turns.map(t => (t.skipped ? "(skip)" : t.reply)).join("|"));
 
-  // Ghost mode: if the user skipped 3+ of 6, that's the signature.
-  if (f.skippedCount >= 3) {
+  // Ghost mode: if the user skipped at least half of their turns, that IS the
+  // signature. Scales with however many turns actually happened.
+  if (turns.length >= 4 && f.skippedCount >= Math.ceil(turns.length / 2)) {
     return { archetype: GHOST_ARCHETYPE, features: f, score: 10 };
   }
 
@@ -286,47 +315,42 @@ function pickArchetypeLocal(history) {
   return { archetype: FALLBACK_ARCHETYPES[seed % FALLBACK_ARCHETYPES.length], features: f, score: 0 };
 }
 
-// ---- AI: generate the next incoming text based on prior conversation ----
+// ---- AI: generate the NEXT text for whichever thread we're in ----
+//
+// Two shapes of call:
+//   - "new thread": pick a fresh sender and write their opening text.
+//   - "continue thread": same sender, next text in the thread, OR decide
+//     the thread should end because the chat is dead.
 
-function buildNextPromptMessages(history, stepIndex, usedSenders) {
-  const threadBlock = history.map((h, i) =>
-    `${i + 1}. "${h.sender}" texted: ${JSON.stringify(h.text)}\n   You replied: ${JSON.stringify(h.reply || '(no reply — the user ignored the text)')}`
-  ).join("\n");
-
-  // Story continuity: we want the thread to feel like an actual chaotic
-  // afternoon on someone's phone — with a rotating cast AND some running
-  // subplots (the same sender might double-text, someone might be reacting
-  // to what just happened in the last message). We explicitly allow the AI
-  // to re-use a prior sender once to keep a subplot alive, but still push
-  // for variety overall.
-  const subplotHint = history.length >= 2
-    ? `You MAY continue one of the existing subplots by re-using a prior sender for a follow-up (e.g. "${history[history.length - 1].sender}" double-texting after the user's reply). Do this at most once per thread. Otherwise introduce a fresh sender.`
-    : `This is early in the thread — introduce a fresh sender, but plant a beat (a situation, a dangling question, a detail) that a later message can callback to.`;
+function buildNewThreadMessages(pastThreads, threadIndex, usedSenders) {
+  const recap = pastThreads.length
+    ? pastThreads.map((t, i) => {
+        const lines = t.turns.map((turn, j) =>
+          `    - "${t.sender}": ${JSON.stringify(turn.text)}\n      you: ${turn.skipped ? '(ignored)' : JSON.stringify(turn.reply || '')}`
+        ).join("\n");
+        return `  Thread ${i + 1} with "${t.sender}":\n${lines}`;
+      }).join("\n")
+    : '  (none yet — this is the first thread.)';
 
   const system =
-    `You are the Texting Decoder engine, scripting a six-message text-message quiz that feels like a real afternoon on someone's phone. ` +
-    `Your job right now is to write ONE NEW incoming text message that the user has to reply to. ` +
-    `The whole thread should feel like a STORY with a rotating cast — each new message reacts to what the user typed and also fits into the larger unfolding afternoon. Threads should include callbacks: a later sender can reference something an earlier sender said, or the user's reply can influence who texts next and why. ` +
-    `Mix the cast across a wide surface area (flirty, logistical, emotional, awkward, nosy, dramatic, etc.) so the user's texting personality is tested broadly. ` +
-    `\n\nSTORY MODE: ${subplotHint} ` +
-    `\n\nCRITICAL — anti-one-word bias: the incoming text MUST invite a substantive reply (more than a single word). Avoid openers that naturally get "k", "lol", "yeah", or a shrug. Good examples: an ambiguous accusation, a vulnerable confession, a messy plan that needs a counter-proposal, a piece of gossip asking "what do i do", a logistics puzzle, a callback to something earlier in the thread. Bad examples: "wyd", "you up?", "you good?", "hey". The opener was already "hey wyd" — don't repeat that energy. ` +
-    `\n\nKeep it SHORT overall — one to three lines, like a real text, but dense enough that a one-word reply would feel rude or insufficient. Do not use emojis unless they're structurally load-bearing. ` +
-    `Lean into tonal specificity from the user's established replies so the thread feels reactive: if they went dry, someone pushes harder; if they were sincere, someone calls them out softly; if they were chaotic, someone asks "are you okay"; if they ignored a previous text, someone double-texts about it. But don't lampshade it — just feel like the next text that would actually land in their phone.\n\n` +
-    `You MUST respond with strict JSON only — no markdown, no commentary, no preamble. Schema:\n` +
+    `You are the Texting Decoder engine. The user is flipping through four SEPARATE text threads on their phone — one per sender. ` +
+    `You are OPENING a brand new thread from a fresh sender. The user has never replied to this person in this session. ` +
+    `\n\nYour job: write ONE opening text message from a new sender that the user has to reply to. ` +
+    `It should probe a DIFFERENT facet of their texting personality than the previous threads did (flirty vs. logistical vs. emotional vs. awkward vs. dramatic, etc.). ` +
+    `\n\nCRITICAL — anti-one-word bias: the incoming text MUST invite a substantive reply (more than a single word). Avoid openers that naturally get "k", "lol", "yeah", or a shrug. Good examples: an ambiguous accusation, a vulnerable confession, a messy plan needing a counter-proposal, gossip asking "what do i do", a logistics puzzle. Bad examples: "wyd", "you up?", "you good?", "hey". The first thread already used "hey wyd" — don't repeat that energy. ` +
+    `\n\nKeep it SHORT: 5–30 words, natural txt register, 1–3 short lines. All lowercase unless the sender is the SHOUTY type. No emoji fireworks. No quotes around the text. No sender name inside the text itself. ` +
+    `\n\nYou MUST respond with strict JSON only — no markdown, no commentary, no preamble. Schema:\n` +
     `{\n` +
-    `  "sender": string,   // 2–6 words, lowercase. Describes who's texting in a specific, funny way. Pick one from the sender bank below, invent a similar one, OR re-use a prior sender IF you are continuing their subplot (per story mode above).\n` +
-    `  "text":   string    // the actual text message, 5–30 words ideally, natural txt register, 1–3 short lines. Must invite a real reply, not a one-word reflex. All lowercase unless the sender is the SHOUTY type. No quotes. No sender name. No emoji fireworks.\n` +
+    `  "sender": string,   // 2–6 words, lowercase. Describes who's texting in a specific, funny way.\n` +
+    `  "text":   string    // the opening text. See rules above.\n` +
     `}\n\n` +
-    `Sender bank (pick one or invent a similar):\n${SENDER_BANK.map(s => `- ${s}`).join('\n')}\n\n` +
-    `Already-used senders: ${usedSenders.map(s => `"${s}"`).join(', ') || '(none yet)'}\n` +
-    `(You may re-use AT MOST ONE of these, and only if you're continuing that subplot with a clear callback. Otherwise pick a fresh sender.)`;
+    `Sender bank (pick one or invent a similar fresh one — must NOT match already-used senders):\n${SENDER_BANK.map(s => `- ${s}`).join('\n')}\n\n` +
+    `Already-used senders (do NOT re-use): ${usedSenders.map(s => `"${s}"`).join(', ') || '(none yet)'}`;
 
   const user =
-    `This is text #${stepIndex + 1} of ${NUM_PROMPTS} in the thread.\n\n` +
-    (history.length
-      ? `Thread so far:\n${threadBlock}\n\n`
-      : `No messages yet — this is the first incoming text.\n\n`) +
-    `Write the next incoming text. Make it land. Return only the JSON object.`;
+    `This is thread #${threadIndex + 1} of ${NUM_THREADS}.\n\n` +
+    `Recap of prior threads (for context — the new sender does NOT know about them):\n${recap}\n\n` +
+    `Open a fresh thread with a new sender. Return only the JSON object.`;
 
   return [
     { role: 'system', content: system },
@@ -334,26 +358,69 @@ function buildNextPromptMessages(history, stepIndex, usedSenders) {
   ];
 }
 
-function sanitizePrompt(parsed, usedSenders, allowReuse) {
+function buildContinueThreadMessages(currentThread, turnIndex) {
+  const threadBlock = currentThread.turns.map((turn, i) =>
+    `  ${i + 1}. "${currentThread.sender}" texted: ${JSON.stringify(turn.text)}\n     You replied: ${turn.skipped ? '(IGNORED — the user chose not to answer)' : JSON.stringify(turn.reply || '')}`
+  ).join("\n");
+
+  const system =
+    `You are the Texting Decoder engine. You are CONTINUING an ongoing 1-on-1 text thread with ONE specific sender ("${currentThread.sender}"). ` +
+    `The user has already exchanged ${currentThread.turns.length} message(s) with this person in this thread. ` +
+    `The thread has a max of ${MAX_TURNS_PER_THREAD} incoming texts. ` +
+    `\n\nYou have TWO choices for this turn:\n` +
+    `  1. Write the NEXT text from the SAME sender that reacts to what the user just said. Keep continuity, use callbacks, let the thread escalate or shift tone.\n` +
+    `  2. DECIDE the conversation is dead and end the thread early. Pick this if the user's last reply killed the energy (one-word, dismissive, ignored the text, etc.) and there's nothing natural left to say.\n` +
+    `\n\nRespond with strict JSON only — no markdown, no preamble. Schema:\n` +
+    `{\n` +
+    `  "action": "continue" | "end",\n` +
+    `  "text":   string | null   // required if action="continue", MUST be null or omitted if action="end".\n` +
+    `}\n\n` +
+    `If action="continue": text must come from the SAME sender ("${currentThread.sender}"), match their established voice, be 5–30 words, natural txt register, no sender label. Invite a substantive reply. ` +
+    `\n\nIf action="end": the user's last reply killed the chat. Return action="end" and text=null. No excuses, no "ok bye" text. ` +
+    `\n\nPrefer "end" when: user sent one-word replies twice in a row, user ignored the most recent text, user replied with pure contempt, or the subject has been fully resolved. ` +
+    `Prefer "continue" when: the user engaged substantively, asked a question, introduced a new beat, or the thread clearly has more to say.`;
+
+  const user =
+    `Thread with "${currentThread.sender}" so far (turn ${turnIndex + 1} of ${MAX_TURNS_PER_THREAD} max):\n${threadBlock}\n\n` +
+    `Decide: continue or end. If continue, write the next text from "${currentThread.sender}". Return only the JSON object.`;
+
+  return [
+    { role: 'system', content: system },
+    { role: 'user',   content: user },
+  ];
+}
+
+function sanitizeOpenPayload(parsed, usedSenders) {
   if (!parsed || typeof parsed !== 'object') return null;
   let sender = typeof parsed.sender === 'string' ? parsed.sender.trim() : '';
   let text   = typeof parsed.text   === 'string' ? parsed.text.trim()   : '';
   if (!sender || !text) return null;
-  // Strip surrounding quotes the model sometimes adds
   text = text.replace(/^["'`]+|["'`]+$/g, '').trim();
   if (!text) return null;
-  // Enforce non-duplicate senders (loose compare) unless we're explicitly
-  // allowing a single subplot callback (see story-mode logic in the prompt).
   const norm = s => s.toLowerCase().replace(/\s+/g, ' ').trim();
-  if (!allowReuse && usedSenders.some(u => norm(u) === norm(sender))) return null;
-  // Truncate absurdly long values defensively
+  if (usedSenders.some(u => norm(u) === norm(sender))) return null;
   if (sender.length > 60) sender = sender.slice(0, 60);
   if (text.length > 240)  text = text.slice(0, 240);
   return { sender, text };
 }
 
-async function fetchNextPromptAI(history, stepIndex, usedSenders) {
-  const messages = buildNextPromptMessages(history, stepIndex, usedSenders);
+function sanitizeContinuePayload(parsed) {
+  if (!parsed || typeof parsed !== 'object') return null;
+  const action = parsed.action;
+  if (action === 'end') return { action: 'end' };
+  if (action === 'continue') {
+    let text = typeof parsed.text === 'string' ? parsed.text.trim() : '';
+    if (!text) return null;
+    text = text.replace(/^["'`]+|["'`]+$/g, '').trim();
+    if (!text) return null;
+    if (text.length > 240) text = text.slice(0, 240);
+    return { action: 'continue', text };
+  }
+  return null;
+}
+
+async function fetchOpenThreadAI(pastThreads, threadIndex, usedSenders) {
+  const messages = buildNewThreadMessages(pastThreads, threadIndex, usedSenders);
   const res = await fetch(AI_ENDPOINT, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -370,43 +437,65 @@ async function fetchNextPromptAI(history, stepIndex, usedSenders) {
   const raw = (data && data.content) || '';
   let parsed;
   try { parsed = JSON.parse(raw); } catch (_) { parsed = null; }
-  // Allow a single sender re-use per thread to enable subplot callbacks.
-  // We count how many distinct prior senders there are vs. history length.
-  const distinctSenders = new Set(usedSenders.map(s => s.toLowerCase().trim())).size;
-  const reuseAlreadyHappened = distinctSenders < usedSenders.length;
-  const allowReuse = !reuseAlreadyHappened;
-  const clean = sanitizePrompt(parsed, usedSenders, allowReuse);
-  if (!clean) throw new Error('bad_ai_prompt_payload');
+  const clean = sanitizeOpenPayload(parsed, usedSenders);
+  if (!clean) throw new Error('bad_ai_open_payload');
+  return clean;
+}
+
+async function fetchContinueThreadAI(currentThread, turnIndex) {
+  const messages = buildContinueThreadMessages(currentThread, turnIndex);
+  const res = await fetch(AI_ENDPOINT, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      slug: SLUG,
+      messages,
+      max_tokens: 220,
+      temperature: 0.8,
+      response_format: 'json_object',
+    }),
+  });
+  if (!res.ok) throw new Error('http_' + res.status);
+  const data = await res.json();
+  const raw = (data && data.content) || '';
+  let parsed;
+  try { parsed = JSON.parse(raw); } catch (_) { parsed = null; }
+  const clean = sanitizeContinuePayload(parsed);
+  if (!clean) throw new Error('bad_ai_continue_payload');
   return clean;
 }
 
 // ---- AI-backed archetype reader ----
 
-function buildAIMessages(history) {
+function buildAIMessages(threads) {
   const candidates = ARCHETYPES.map(a => `- ${a.name}: ${a.tag}`).join("\n");
-  const skippedCount = history.filter(h => h.skipped).length;
-  const repliesBlock = history.map((h, i) =>
-    `${i + 1}. From "${h.sender}" (text: "${h.text}")\n   Reply: ${h.skipped ? '(NO REPLY — the user chose not to answer this one)' : JSON.stringify(h.reply || "")}`
-  ).join("\n");
+  const turns = flattenTurns(threads);
+  const skippedCount = turns.filter(t => t.skipped).length;
+  const threadsBlock = threads.map((t, i) => {
+    const lines = t.turns.map((turn, j) =>
+      `   ${j + 1}. "${t.sender}": ${JSON.stringify(turn.text)}\n      reply: ${turn.skipped ? '(NO REPLY — the user chose not to answer)' : JSON.stringify(turn.reply || '')}`
+    ).join("\n");
+    return `Thread ${i + 1} with "${t.sender}" (${t.turns.length} text${t.turns.length === 1 ? '' : 's'}):\n${lines}`;
+  }).join("\n\n");
 
   const system =
     `You are the Texting Decoder — a sharp, dry-witted analyst who reads what someone's text replies reveal about their thumbs, vibe, and emotional handwriting. ` +
-    `You produce ONE short, punchy texting archetype based on the user's six actual replies. ` +
-    `You must pay close attention to: capitalization, punctuation, ellipses, emoji, abbreviations, sentence length, tone, sincerity, deflection, who the recipient is, WHICH messages the user ignored (leaving someone on read is loud), and any patterns across the six turns. ` +
+    `You produce ONE short, punchy texting archetype based on the user's replies across FOUR separate text threads with four different senders. ` +
+    `You must pay close attention to: capitalization, punctuation, ellipses, emoji, abbreviations, sentence length, tone, sincerity, deflection, WHO they're replying to (did they soften with mom, get dry with an ex?), WHICH messages they ignored (leaving someone on read is loud), and any patterns across the conversations. ` +
     `\n\nYou MUST respond with strict JSON only — no markdown, no commentary, no preamble. Schema:\n` +
     `{\n` +
-    `  "name": string,        // 2–5 words, Title Case, like "The Lowercase Romantic" or "Captain Capslock". Punchy. Ownable. Worthy of being someone's identity for the day.\n` +
-    `  "tag":  string,        // ONE sentence (max ~22 words), all-lowercase or sentence case, in our voice. No emojis. No hashtags. No "you are" framing — write it as a description of the archetype itself.\n` +
-    `  "tells": string[]      // 3 or 4 sharp observations grounded in the actual replies. Each ≤ 18 words. Each one should reference a concrete pattern (a specific reply, a count, a habit). No vague horoscope filler. No emojis. No hashtags.\n` +
+    `  "name": string,        // 2–5 words, Title Case, like "The Lowercase Romantic" or "Captain Capslock". Punchy. Ownable.\n` +
+    `  "tag":  string,        // ONE sentence (max ~22 words), all-lowercase or sentence case, in our voice. No emojis. No hashtags. No "you are" framing.\n` +
+    `  "tells": string[]      // 3 or 4 sharp observations grounded in the actual replies. Each ≤ 18 words. Each one should reference a concrete pattern. No vague horoscope filler.\n` +
     `}\n\n` +
     `Voice rules: confident, observational, slightly mean in a fond way, like a friend roasting your group chat. Never therapy-speak. Never "great choice!" energy. Never ask follow-up questions. Never explain your reasoning outside the JSON.\n\n` +
-    `Archetype selection: prefer one of the listed candidates if it genuinely fits. If none fit well, invent a new archetype in the same style ("The ___ ___" or "Captain ___" or "The ___ Poet"). Do not just default to a generic option — match the actual evidence.\n\n` +
+    `Archetype selection: prefer one of the listed candidates if it genuinely fits. If none fit well, invent a new archetype in the same style. Do not just default to a generic option — match the actual evidence.\n\n` +
     `Candidate archetypes (use one of these names verbatim if it fits, or invent a new one):\n${candidates}`;
 
   const user =
-    `Here are my six turns, in order. Read all six together — patterns matter more than any single turn. ` +
-    (skippedCount > 0 ? `NOTE: the user chose not to reply to ${skippedCount} of 6 — ghosting IS a signal, weight it. ` : ``) +
-    `\n\n${repliesBlock}\n\n` +
+    `Here are my four threads, in order. Read them all together — patterns across threads matter more than any single turn. ` +
+    (skippedCount > 0 ? `NOTE: the user chose not to reply to ${skippedCount} message(s) — ghosting IS a signal, weight it. ` : ``) +
+    `\n\n${threadsBlock}\n\n` +
     `Return only the JSON object. No prose around it.`;
 
   return [
@@ -429,8 +518,8 @@ function sanitizeAIResult(parsed) {
   return { name, tag, tells };
 }
 
-async function pickArchetypeAI(history) {
-  const messages = buildAIMessages(history);
+async function pickArchetypeAI(threads) {
+  const messages = buildAIMessages(threads);
   const res = await fetch(AI_ENDPOINT, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -452,27 +541,27 @@ async function pickArchetypeAI(history) {
   return clean;
 }
 
-// ---- tells ----
+// ---- tells (local fallback) ----
 
 function buildTells(f) {
   const tells = [];
 
   if (f.skippedCount >= 1) {
-    tells.push(`${f.skippedCount} of 6 left on read. silence is a reply too.`);
+    tells.push(`${f.skippedCount} message${f.skippedCount === 1 ? '' : 's'} left on read. silence is a reply too.`);
   }
   if (f.periodTotal === 0 && f.ellipsisTotal >= 1) {
     tells.push(`zero full stops, ${f.ellipsisTotal} ellipses detected… the room is reading.`);
   }
   if (f.emojiTotal >= 4) {
-    tells.push(`${f.emojiTotal} emoji across six replies — thumbs fluent in feelings.`);
+    tells.push(`${f.emojiTotal} emoji across your replies — thumbs fluent in feelings.`);
   } else if (f.emojiTotal === 0) {
     tells.push(`zero emoji. pure text, radical restraint.`);
   }
-  if (f.allLowerCount >= 4) {
-    tells.push(`${f.allLowerCount} of 6 replies all-lowercase. soft-launch energy.`);
+  if (f.allLowerCount >= 3) {
+    tells.push(`${f.allLowerCount} replies all-lowercase. soft-launch energy.`);
   }
   if (f.shoutyCount >= 1) {
-    tells.push(`${f.shoutyCount} reply${f.shoutyCount > 1 ? " in ALL CAPS" : " in ALL CAPS"}. passion delivery.`);
+    tells.push(`${f.shoutyCount} reply in ALL CAPS. passion delivery.`);
   }
   if (f.questionTotal >= 3) {
     tells.push(`${f.questionTotal} question marks deployed. interrogation-first diplomacy.`);
@@ -488,7 +577,7 @@ function buildTells(f) {
   }
   if (f.avgLen > 75) {
     tells.push(`avg reply: ${Math.round(f.avgLen)} characters. TED talks on tap.`);
-  } else if (f.avgLen < 15) {
+  } else if (f.avgLen < 15 && f.answeredCount >= 2) {
     tells.push(`avg reply: ${Math.round(f.avgLen)} characters. radical efficiency.`);
   }
   if (f.commaTotal >= 5) {
@@ -509,9 +598,17 @@ function buildTells(f) {
 }
 
 // ---- UI ----
+//
+// state.threads is an array of { sender, text_count_goal?, turns: [{ text, reply, skipped }] }
+// Each thread's `turns.length` grows from 0..MAX_TURNS_PER_THREAD.
+// state.activeThreadIdx points at the current thread.
+// state.pendingPrompt is the current unanswered incoming text (its text is
+// already pushed into the current thread's turns[last] with no reply yet).
 
-// state.history = [{ sender, text, reply, skipped }]
-const state = { step: 0, history: [], pendingPrompt: null };
+const state = {
+  threads: [],
+  activeThreadIdx: 0,
+};
 const $ = id => document.getElementById(id);
 
 function showScreen(name) {
@@ -529,70 +626,88 @@ function setInputEnabled(enabled) {
 }
 
 function startQuiz() {
-  state.step = 0;
-  state.history = [];
-  state.pendingPrompt = { sender: OPENER.sender, text: OPENER.text };
+  state.threads = [];
+  state.activeThreadIdx = 0;
+  // First thread uses the deterministic opener.
+  state.threads.push({
+    sender: OPENER.sender,
+    turns: [{ text: OPENER.text, reply: "", skipped: false, answered: false }],
+    closed: false,
+  });
   showScreen("quiz");
   renderThread({ typing: false });
 }
 
-// Build the entire live thread each time: prior turns as smaller "past"
-// bubbles (so the user has history/context), then the current incoming
-// prompt as the active bubble. If `typing` is true, the current bubble
-// shows the typing indicator instead of the prompt text.
+function activeThread() {
+  return state.threads[state.activeThreadIdx];
+}
+
+function currentUnansweredTurn() {
+  const th = activeThread();
+  if (!th) return null;
+  const last = th.turns[th.turns.length - 1];
+  if (!last) return null;
+  return last.answered ? null : last;
+}
+
+function progressFraction() {
+  // Progress by: completed threads count, out of NUM_THREADS. This is the
+  // mental model the user has ("I'm 2 of 4 convos in").
+  const done = state.threads.filter(t => t.closed).length;
+  return done / NUM_THREADS;
+}
+
+// Render the ACTIVE thread only. Prior threads live behind as "past threads"
+// (rendered in the result screen) — the quiz view stays focused on one chat.
 function renderThread({ typing, typingText }) {
   const thread = $("chat-thread");
   thread.innerHTML = "";
 
-  // Past turns
-  state.history.forEach((h) => {
+  const th = activeThread();
+  if (!th) return;
+
+  // Sender header bar — reinforces that this is ONE conversation with ONE
+  // person, distinct from the other threads.
+  const header = document.createElement("div");
+  header.className = "thread-header";
+  header.innerHTML =
+    `<span class="thread-avatar" aria-hidden="true"></span>` +
+    `<span class="thread-sender">${escapeHtml(th.sender)}</span>` +
+    `<span class="thread-meta">Chat ${state.activeThreadIdx + 1} of ${NUM_THREADS}</span>`;
+  thread.appendChild(header);
+
+  // All turns in THIS thread so far.
+  th.turns.forEach((turn, idx) => {
+    const isLast = idx === th.turns.length - 1;
     const incoming = document.createElement("div");
-    incoming.className = "bubble incoming past";
-    const sn = document.createElement("span");
-    sn.className = "sender-name";
-    sn.textContent = h.sender;
+    incoming.className = "bubble incoming" + (turn.answered ? " past" : "");
     const bt = document.createElement("span");
     bt.className = "bubble-text";
-    bt.textContent = h.text;
-    incoming.appendChild(sn);
+    if (isLast && typing) {
+      bt.textContent = typingText || "…";
+      incoming.classList.add("typing");
+    } else {
+      bt.textContent = turn.text;
+    }
     incoming.appendChild(bt);
     thread.appendChild(incoming);
 
-    const outgoing = document.createElement("div");
-    outgoing.className = "bubble outgoing past" + (h.skipped ? " skipped" : "");
-    outgoing.textContent = h.skipped ? "(ignored)" : h.reply;
-    thread.appendChild(outgoing);
+    if (turn.answered) {
+      const outgoing = document.createElement("div");
+      outgoing.className = "bubble outgoing past" + (turn.skipped ? " skipped" : "");
+      outgoing.textContent = turn.skipped ? "(ignored)" : turn.reply;
+      thread.appendChild(outgoing);
+    }
   });
 
-  // Current prompt bubble (always the last incoming)
-  const p = state.pendingPrompt;
-  if (p) {
-    const cur = document.createElement("div");
-    cur.className = "bubble incoming";
-    cur.id = "prompt-bubble";
-    const sn = document.createElement("span");
-    sn.className = "sender-name";
-    sn.id = "sender-name";
-    sn.textContent = typing ? "" : p.sender;
-    const bt = document.createElement("span");
-    bt.className = "bubble-text";
-    bt.id = "prompt-text";
-    bt.textContent = typing ? (typingText || "…") : p.text;
-    cur.appendChild(sn);
-    cur.appendChild(bt);
-    thread.appendChild(cur);
-  }
-
-  $("progress-label").textContent = `Text ${Math.min(state.step + 1, NUM_PROMPTS)} of ${NUM_PROMPTS}`;
-  $("progress-bar").style.width = `${(state.step / NUM_PROMPTS) * 100}%`;
+  $("progress-label").textContent = `Chat ${state.activeThreadIdx + 1} of ${NUM_THREADS}`;
+  $("progress-bar").style.width = `${progressFraction() * 100}%`;
   $("error-msg").classList.add("hidden");
 
   if (!typing) {
     $("reply-input").value = "";
     setInputEnabled(true);
     setTimeout(() => $("reply-input").focus(), 120);
-    // Scroll the latest bubble into view so context stays visible but the
-    // current prompt is anchored near the input.
     const last = thread.lastElementChild;
     if (last && typeof last.scrollIntoView === "function") {
       last.scrollIntoView({ behavior: "smooth", block: "nearest" });
@@ -602,32 +717,104 @@ function renderThread({ typing, typingText }) {
   }
 }
 
-function recordTurn({ reply, skipped }) {
-  const current = state.pendingPrompt;
-  state.history.push({
-    sender: current.sender,
-    text: current.text,
-    reply: skipped ? "" : reply,
-    skipped: !!skipped,
-  });
-  state.step++;
-  $("progress-bar").style.width = `${(state.step / NUM_PROMPTS) * 100}%`;
+function recordCurrentTurn({ reply, skipped }) {
+  const turn = currentUnansweredTurn();
+  if (!turn) return;
+  turn.reply = skipped ? "" : reply;
+  turn.skipped = !!skipped;
+  turn.answered = true;
 }
 
-async function advanceAfterTurn() {
-  if (state.step >= NUM_PROMPTS) {
+async function advance() {
+  const th = activeThread();
+  if (!th) { finishQuiz(); return; }
+
+  // Decide: continue this thread, or move to the next thread.
+  const answeredTurns = th.turns.filter(t => t.answered).length;
+  const canContinue = !th.closed && answeredTurns < MAX_TURNS_PER_THREAD;
+
+  if (canContinue) {
+    // Ask the AI if the thread should continue or end.
+    // Show typing state inside the current thread while we decide.
+    const seed = hash(th.turns.map(t => t.reply || "(skip)").join("|")) + answeredTurns;
+    const typingText = TYPING_MSGS[seed % TYPING_MSGS.length];
+    // Append a placeholder incoming that's typing.
+    th.turns.push({ text: "…", reply: "", skipped: false, answered: false, _placeholder: true });
+    renderThread({ typing: true, typingText });
+
+    let decision = null;
+    try {
+      decision = await fetchContinueThreadAI(
+        { sender: th.sender, turns: th.turns.filter(t => !t._placeholder) },
+        answeredTurns
+      );
+    } catch (_) {
+      // Fallback: continue with a generic follow-up up to 2 turns, else end.
+      if (answeredTurns < 2) {
+        decision = { action: 'continue', text: FALLBACK_THREAD_FOLLOWUPS[answeredTurns % FALLBACK_THREAD_FOLLOWUPS.length] };
+      } else {
+        decision = { action: 'end' };
+      }
+    }
+
+    // Pop the placeholder before committing the real outcome.
+    const placeholderIdx = th.turns.findIndex(t => t._placeholder);
+    if (placeholderIdx >= 0) th.turns.splice(placeholderIdx, 1);
+
+    if (decision.action === 'continue') {
+      th.turns.push({ text: decision.text, reply: "", skipped: false, answered: false });
+      renderThread({ typing: false });
+      return;
+    }
+    // else action === 'end' — fall through to close-thread path
+    th.closed = true;
+  } else {
+    th.closed = true;
+  }
+
+  // Thread is closed — advance to next thread (or finish).
+  state.activeThreadIdx++;
+  if (state.activeThreadIdx >= NUM_THREADS) {
     finishQuiz();
     return;
   }
-  // Typing state for the next incoming message.
-  const seed = hash(state.history.map(h => h.reply || "(skip)").join("|")) + state.step;
+  await openNextThread();
+}
+
+async function openNextThread() {
+  // Typing state while we ask the AI for a new sender/opening text.
+  const usedSenders = state.threads.map(t => t.sender);
+  const seed = hash(usedSenders.join("|")) + state.activeThreadIdx;
   const typingText = TYPING_MSGS[seed % TYPING_MSGS.length];
-  // Clear the old prompt, show thread + typing bubble.
-  state.pendingPrompt = { sender: "", text: typingText };
+
+  // Insert a placeholder thread to render a typing indicator inside.
+  const placeholder = {
+    sender: "…",
+    turns: [{ text: "…", reply: "", skipped: false, answered: false, _placeholder: true }],
+    closed: false,
+    _placeholder: true,
+  };
+  state.threads.push(placeholder);
   renderThread({ typing: true, typingText });
 
-  const next = await fetchNextPromptWithFallback();
-  state.pendingPrompt = next;
+  let opened = null;
+  try {
+    const pastThreads = state.threads.slice(0, state.activeThreadIdx);
+    opened = await fetchOpenThreadAI(pastThreads, state.activeThreadIdx, usedSenders);
+  } catch (_) {
+    // Fallback: pick an unused opener.
+    const remaining = FALLBACK_THREAD_OPENERS.filter(p => !usedSenders.includes(p.sender));
+    const pool = remaining.length ? remaining : FALLBACK_THREAD_OPENERS;
+    const fseed = hash(usedSenders.join("|") + state.activeThreadIdx);
+    opened = pool[fseed % pool.length];
+  }
+
+  // Replace placeholder with real thread.
+  state.threads[state.activeThreadIdx] = {
+    sender: opened.sender,
+    turns: [{ text: opened.text, reply: "", skipped: false, answered: false }],
+    closed: false,
+  };
   renderThread({ typing: false });
 }
 
@@ -636,60 +823,35 @@ async function submitReply(e) {
   const val = $("reply-input").value.trim();
   if (!val) {
     const err = $("error-msg");
-    err.textContent = "say something, or tap 'don't reply'.";
+    err.textContent = "say something, or tap 'leave on read'.";
     err.classList.remove("hidden");
     return;
   }
-  recordTurn({ reply: val, skipped: false });
-  advanceAfterTurn();
+  recordCurrentTurn({ reply: val, skipped: false });
+  advance();
 }
 
 function skipReply() {
   if ($("skip-btn").disabled) return;
-  // Skipping counts as a signal too — the AI and the local analyzer both
-  // use "no reply" as a tell (silence IS a reply).
-  recordTurn({ reply: "", skipped: true });
-  advanceAfterTurn();
-}
-
-async function fetchNextPromptWithFallback() {
-  const usedSenders = state.history.map(h => h.sender);
-  // Dedupe against the pending prompt's sender too, just in case.
-  const minDelay = new Promise(r => setTimeout(r, 500));
-  try {
-    const [p] = await Promise.all([
-      fetchNextPromptAI(state.history, state.step, usedSenders),
-      minDelay,
-    ]);
-    return p;
-  } catch (_) {
-    // Offline path: pick a fallback prompt that hasn't been used yet.
-    await minDelay;
-    const remaining = FALLBACK_PROMPTS.filter(p => !usedSenders.includes(p.sender));
-    const pool = remaining.length ? remaining : FALLBACK_PROMPTS;
-    const seed = hash(state.history.map(h => h.reply).join("|") + state.step);
-    return pool[seed % pool.length];
-  }
+  recordCurrentTurn({ reply: "", skipped: true });
+  advance();
 }
 
 async function finishQuiz() {
   showScreen("loading");
-  const seed = hash(state.history.map(h => (h.skipped ? "(skip)" : h.reply)).join("|"));
+  const turns = flattenTurns(state.threads);
+  const seed = hash(turns.map(t => (t.skipped ? "(skip)" : t.reply)).join("|"));
   $("loading-copy").textContent = LOADING_MSGS[seed % LOADING_MSGS.length];
 
-  // Run AI call and a minimum-loading-time timer in parallel so the
-  // typing-bubble never flashes by too fast.
   const minDelay = new Promise(r => setTimeout(r, 1200));
   let result;
   try {
-    const aiPromise = pickArchetypeAI(state.history);
+    const aiPromise = pickArchetypeAI(state.threads);
     const [aiResult] = await Promise.all([aiPromise, minDelay]);
     result = { name: aiResult.name, tag: aiResult.tag, tells: aiResult.tells };
   } catch (_) {
-    // Deterministic offline fallback — keeps the app working if the proxy
-    // is rate-limited, capped, or down.
     await minDelay;
-    const local = pickArchetypeLocal(state.history);
+    const local = pickArchetypeLocal(state.threads);
     result = {
       name: local.archetype.name,
       tag: local.archetype.tag,
@@ -703,20 +865,35 @@ function renderResult(result) {
   $("archetype-name").textContent = result.name;
   $("archetype-tag").textContent = result.tag;
 
-  const thread = $("result-thread");
-  thread.innerHTML = "";
-  state.history.forEach((h) => {
-    const incoming = document.createElement("div");
-    incoming.className = "bubble incoming";
-    incoming.innerHTML =
-      `<span class="sender-name">${escapeHtml(h.sender)}</span>` +
-      `<span class="bubble-text">${escapeHtml(h.text)}</span>`;
-    thread.appendChild(incoming);
+  const threadHost = $("result-thread");
+  threadHost.innerHTML = "";
 
-    const outgoing = document.createElement("div");
-    outgoing.className = "bubble outgoing" + (h.skipped ? " skipped" : "");
-    outgoing.textContent = h.skipped ? "(left on read)" : h.reply;
-    thread.appendChild(outgoing);
+  // Render each thread as its own mini-block so the share card matches the
+  // "separate DMs" mental model.
+  state.threads.forEach((t, i) => {
+    const block = document.createElement("div");
+    block.className = "result-thread-block";
+
+    const header = document.createElement("div");
+    header.className = "result-thread-header";
+    header.textContent = t.sender;
+    block.appendChild(header);
+
+    t.turns.forEach(turn => {
+      const incoming = document.createElement("div");
+      incoming.className = "bubble incoming";
+      incoming.innerHTML = `<span class="bubble-text">${escapeHtml(turn.text)}</span>`;
+      block.appendChild(incoming);
+
+      if (turn.answered) {
+        const outgoing = document.createElement("div");
+        outgoing.className = "bubble outgoing" + (turn.skipped ? " skipped" : "");
+        outgoing.textContent = turn.skipped ? "(left on read)" : turn.reply;
+        block.appendChild(outgoing);
+      }
+    });
+
+    threadHost.appendChild(block);
   });
 
   const tellsEl = $("result-tells");
@@ -741,9 +918,8 @@ function escapeHtml(s) {
 }
 
 function retry() {
-  state.step = 0;
-  state.history = [];
-  state.pendingPrompt = null;
+  state.threads = [];
+  state.activeThreadIdx = 0;
   showScreen("intro");
 }
 
