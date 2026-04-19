@@ -214,6 +214,20 @@ body::before {
   gap: 10px;
 }
 
+/* Prior turns in the live quiz thread — slightly smaller so the current
+   prompt still reads as the one you're answering. */
+#chat-thread .bubble.past {
+  font-size: 15px;
+  padding: 10px 14px;
+  box-shadow: 2px 2px 0 var(--edge);
+  opacity: 0.85;
+}
+#chat-thread .bubble.past.skipped {
+  font-style: italic;
+  color: var(--muted);
+  background: #fff;
+}
+
 .bubble {
   position: relative;
   display: inline-block;
@@ -247,6 +261,12 @@ body::before {
   color: var(--ink);
   border-bottom-right-radius: 6px;
 }
+.bubble.outgoing.skipped {
+  background: #fff;
+  color: var(--muted);
+  font-style: italic;
+  letter-spacing: 0.04em;
+}
 
 .sender-name {
   display: block;
@@ -266,6 +286,22 @@ body::before {
   bottom: 18px;
   background: var(--paper);
   padding-top: 4px;
+}
+
+.reply-extras {
+  display: flex;
+  justify-content: flex-end;
+  margin-top: 2px;
+  padding-right: 4px;
+}
+.reply-extras .ghost-btn {
+  font-size: 13px;
+  padding: 6px 10px;
+  min-height: 0;
+}
+.reply-extras .ghost-btn:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
 }
 
 #reply-input {

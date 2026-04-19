@@ -39,11 +39,8 @@
         <div class="progress-track"><div id="progress-bar"></div></div>
       </div>
 
-      <div class="chat-thread">
-        <div class="bubble incoming" id="prompt-bubble">
-          <span class="sender-name" id="sender-name"></span>
-          <span class="bubble-text" id="prompt-text"></span>
-        </div>
+      <div class="chat-thread" id="chat-thread">
+        <!-- Prior turns get rendered here, and the current prompt appends last -->
       </div>
 
       <form id="reply-form" class="reply-row" autocomplete="off">
@@ -54,11 +51,14 @@
           autocomplete="off"
           autocapitalize="sentences"
           spellcheck="false"
-          maxlength="140"
+          maxlength="280"
           placeholder="type your reply…"
           required>
         <button type="submit" id="send-btn" aria-label="Send reply">↑</button>
       </form>
+      <div class="reply-extras">
+        <button type="button" id="skip-btn" class="ghost-btn">don't reply →</button>
+      </div>
       <p id="error-msg" class="error hidden"></p>
     </section>
 
