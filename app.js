@@ -1,19 +1,40 @@
 // Texting Decoder — reply to six texts, get your archetype.
-// Uses the shared ef-ai-proxy to actually read the user's replies and
-// decide on (or invent) a fitting archetype + tells. Deterministic-ish
-// via temperature 0; falls back to a local heuristic if the proxy fails.
+// Now fully AI-driven: the INCOMING texts are generated on the fly based on your
+// previous replies, so the "chat thread" feels like a real conversation that
+// evolves with your tone. The final archetype read is also AI-generated.
+// Uses the shared ef-ai-proxy. Falls back to deterministic local paths if the
+// proxy fails so the app never breaks.
 
 const AI_ENDPOINT = 'https://uy3l6suz07.execute-api.us-east-1.amazonaws.com/ai';
 const SLUG = 'texting-decoder';
+const NUM_PROMPTS = 6;
 
-const PROMPTS = [
-  { sender: "someone you half-know",       text: "hey wyd" },
-  { sender: "your roommate",               text: "did u eat" },
-  { sender: "your situationship, unprompted", text: "been thinking about u lately" },
-  { sender: "a friend, 11:47pm",           text: "my week has been the worst" },
-  { sender: "the group chat",              text: "we still on for saturday??" },
-  { sender: "your ex, randomly",           text: "saw something that reminded me of u" },
+// A small bank of possible "senders" the AI can pick from when generating the
+// next incoming text. This keeps the cast diverse and weirdly specific — the
+// thing that makes the screenshot funny.
+const SENDER_BANK = [
+  "someone you half-know",
+  "your roommate",
+  "your situationship, unprompted",
+  "a friend, 11:47pm",
+  "the group chat",
+  "your ex, randomly",
+  "your mom",
+  "your boss, on a sunday",
+  "the crush from the party",
+  "your most dramatic friend",
+  "a person you owe $7",
+  "your old coworker, out of nowhere",
+  "your group chat nemesis",
+  "the cousin who overshares",
+  "the one who's always manifesting",
+  "your dentist's front desk",
+  "a matched dating app chat",
 ];
+
+// Deterministic opener — always the same first message so the UX has a clean
+// start. The AI takes over from message 2 onward, reacting to your replies.
+const OPENER = { sender: "someone you half-know", text: "hey wyd" };
 
 const LOADING_MSGS = [
   "reading between the periods…",
@@ -25,8 +46,13 @@ const LOADING_MSGS = [
   "waiting for read receipts from the cosmos…",
 ];
 
-// Archetype library — given to the AI as candidates, but it can also invent
-// a new one if none fits. Also used by the offline fallback path.
+const TYPING_MSGS = [
+  "they're typing…",
+  "…",
+  "new thread incoming…",
+  "another one's coming in…",
+  "thumb activity detected…",
+];
 
 // ---- archetype catalog (signature archetypes — every one is a label a user would own) ----
 
@@ -145,6 +171,16 @@ const FALLBACK_ARCHETYPES = [
   { name: "The Third-Screen Oracle",        tag: "replies as if reading from a book no one else can see. we trust you anyway." },
 ];
 
+// Offline fallback prompts — only used if the AI-prompt-generation call fails.
+// These guarantee the quiz always advances to six even with no network.
+const FALLBACK_PROMPTS = [
+  { sender: "your roommate",               text: "did u eat" },
+  { sender: "your situationship, unprompted", text: "been thinking about u lately" },
+  { sender: "a friend, 11:47pm",           text: "my week has been the worst" },
+  { sender: "the group chat",              text: "we still on for saturday??" },
+  { sender: "your ex, randomly",           text: "saw something that reminded me of u" },
+];
+
 // ---- feature extraction ----
 
 function hash(str) {
@@ -227,12 +263,87 @@ function pickArchetypeLocal(replies) {
   return { archetype: FALLBACK_ARCHETYPES[seed % FALLBACK_ARCHETYPES.length], features: f, score: 0 };
 }
 
+// ---- AI: generate the next incoming text based on prior conversation ----
+
+function buildNextPromptMessages(history, stepIndex, usedSenders) {
+  const threadBlock = history.map((h, i) =>
+    `${i + 1}. "${h.sender}" texted: ${JSON.stringify(h.text)}\n   You replied: ${JSON.stringify(h.reply)}`
+  ).join("\n");
+
+  const system =
+    `You are the Texting Decoder engine, scripting a six-message text-message quiz that feels like a real, chaotic phone. ` +
+    `Your job right now is to write ONE NEW incoming text message that the user has to reply to. ` +
+    `The message must feel like it comes from a DIFFERENT person than any already used, with a distinct vibe, so the user's texting personality is tested across a wide surface area (flirty, logistical, emotional, awkward, nosy, dramatic, etc.). ` +
+    `The text should feel slightly pressuring to reply to — a question, a vulnerable statement, an ambiguous opener, a plan, a crumb, an accusation, something they can't just ignore. ` +
+    `Keep it SHORT — one to two lines, like a real text. Do not use emojis unless they're structurally load-bearing. ` +
+    `Lean into tonal specificity from the user's established replies so the thread feels reactive: if they went dry, someone pushes harder; if they were sincere, someone calls them out softly; if they were chaotic, someone asks "are you okay". But don't lampshade it — just feel like the next text that would actually land in their phone.\n\n` +
+    `You MUST respond with strict JSON only — no markdown, no commentary, no preamble. Schema:\n` +
+    `{\n` +
+    `  "sender": string,   // 2–6 words, lowercase. Describes who's texting in a specific, funny way. Pick one from the sender bank below, or invent one in the same style. Must not duplicate any already-used sender.\n` +
+    `  "text":   string    // the actual text message, 1–14 words, natural txt register. All lowercase unless the sender is the SHOUTY type. No quotes. No sender name. No emoji fireworks.\n` +
+    `}\n\n` +
+    `Sender bank (pick one or invent a similar):\n${SENDER_BANK.map(s => `- ${s}`).join('\n')}\n\n` +
+    `Already-used senders (do NOT reuse, invent fresh variety): ${usedSenders.map(s => `"${s}"`).join(', ') || '(none yet)'}`;
+
+  const user =
+    `This is text #${stepIndex + 1} of ${NUM_PROMPTS} in the thread.\n\n` +
+    (history.length
+      ? `Thread so far:\n${threadBlock}\n\n`
+      : `No messages yet — this is the first incoming text.\n\n`) +
+    `Write the next incoming text. Return only the JSON object.`;
+
+  return [
+    { role: 'system', content: system },
+    { role: 'user',   content: user },
+  ];
+}
+
+function sanitizePrompt(parsed, usedSenders) {
+  if (!parsed || typeof parsed !== 'object') return null;
+  let sender = typeof parsed.sender === 'string' ? parsed.sender.trim() : '';
+  let text   = typeof parsed.text   === 'string' ? parsed.text.trim()   : '';
+  if (!sender || !text) return null;
+  // Strip surrounding quotes the model sometimes adds
+  text = text.replace(/^["'`]+|["'`]+$/g, '').trim();
+  if (!text) return null;
+  // Enforce non-duplicate senders (loose compare)
+  const norm = s => s.toLowerCase().replace(/\s+/g, ' ').trim();
+  if (usedSenders.some(u => norm(u) === norm(sender))) return null;
+  // Truncate absurdly long values defensively
+  if (sender.length > 60) sender = sender.slice(0, 60);
+  if (text.length > 160)  text = text.slice(0, 160);
+  return { sender, text };
+}
+
+async function fetchNextPromptAI(history, stepIndex, usedSenders) {
+  const messages = buildNextPromptMessages(history, stepIndex, usedSenders);
+  const res = await fetch(AI_ENDPOINT, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      slug: SLUG,
+      messages,
+      max_tokens: 160,
+      temperature: 0.85,
+      response_format: 'json_object',
+    }),
+  });
+  if (!res.ok) throw new Error('http_' + res.status);
+  const data = await res.json();
+  const raw = (data && data.content) || '';
+  let parsed;
+  try { parsed = JSON.parse(raw); } catch (_) { parsed = null; }
+  const clean = sanitizePrompt(parsed, usedSenders);
+  if (!clean) throw new Error('bad_ai_prompt_payload');
+  return clean;
+}
+
 // ---- AI-backed archetype reader ----
 
-function buildAIMessages(replies) {
+function buildAIMessages(history) {
   const candidates = ARCHETYPES.map(a => `- ${a.name}: ${a.tag}`).join("\n");
-  const repliesBlock = PROMPTS.map((p, i) =>
-    `${i + 1}. From "${p.sender}" (text: "${p.text}")\n   Reply: ${JSON.stringify(replies[i] || "")}`
+  const repliesBlock = history.map((h, i) =>
+    `${i + 1}. From "${h.sender}" (text: "${h.text}")\n   Reply: ${JSON.stringify(h.reply || "")}`
   ).join("\n");
 
   const system =
@@ -274,8 +385,8 @@ function sanitizeAIResult(parsed) {
   return { name, tag, tells };
 }
 
-async function pickArchetypeAI(replies) {
-  const messages = buildAIMessages(replies);
+async function pickArchetypeAI(history) {
+  const messages = buildAIMessages(history);
   const res = await fetch(AI_ENDPOINT, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -352,7 +463,8 @@ function buildTells(f) {
 
 // ---- UI ----
 
-const state = { step: 0, replies: [] };
+// state.history = [{ sender, text, reply }]
+const state = { step: 0, history: [], pendingPrompt: null };
 const $ = id => document.getElementById(id);
 
 function showScreen(name) {
@@ -362,32 +474,41 @@ function showScreen(name) {
   window.scrollTo(0, 0);
 }
 
+function setInputEnabled(enabled) {
+  $("reply-input").disabled = !enabled;
+  $("send-btn").disabled = !enabled;
+}
+
 function startQuiz() {
   state.step = 0;
-  state.replies = [];
+  state.history = [];
+  state.pendingPrompt = { sender: OPENER.sender, text: OPENER.text };
   showScreen("quiz");
   renderPrompt();
 }
 
 function renderPrompt() {
-  const p = PROMPTS[state.step];
+  const p = state.pendingPrompt;
+  if (!p) return;
   $("sender-name").textContent = p.sender;
   $("prompt-text").textContent = p.text;
 
   // Re-trigger the pop animation
   const bubble = $("prompt-bubble");
+  bubble.classList.remove("hidden");
   bubble.style.animation = "none";
   void bubble.offsetWidth;
   bubble.style.animation = "";
 
-  $("progress-label").textContent = `Text ${state.step + 1} of ${PROMPTS.length}`;
-  $("progress-bar").style.width = `${(state.step / PROMPTS.length) * 100}%`;
+  $("progress-label").textContent = `Text ${state.step + 1} of ${NUM_PROMPTS}`;
+  $("progress-bar").style.width = `${(state.step / NUM_PROMPTS) * 100}%`;
   $("error-msg").classList.add("hidden");
   $("reply-input").value = "";
+  setInputEnabled(true);
   setTimeout(() => $("reply-input").focus(), 120);
 }
 
-function submitReply(e) {
+async function submitReply(e) {
   e.preventDefault();
   const val = $("reply-input").value.trim();
   if (!val) {
@@ -396,19 +517,54 @@ function submitReply(e) {
     err.classList.remove("hidden");
     return;
   }
-  state.replies.push(val);
+
+  // Record this turn in the history.
+  const current = state.pendingPrompt;
+  state.history.push({ sender: current.sender, text: current.text, reply: val });
   state.step++;
-  $("progress-bar").style.width = `${(state.step / PROMPTS.length) * 100}%`;
-  if (state.step >= PROMPTS.length) {
+  $("progress-bar").style.width = `${(state.step / NUM_PROMPTS) * 100}%`;
+
+  if (state.step >= NUM_PROMPTS) {
     finishQuiz();
-  } else {
-    renderPrompt();
+    return;
+  }
+
+  // Show a "typing" state while the next incoming text is generated by the AI.
+  setInputEnabled(false);
+  const bubble = $("prompt-bubble");
+  bubble.classList.add("hidden");
+  $("sender-name").textContent = "";
+  const seed = hash(state.history.map(h => h.reply).join("|")) + state.step;
+  $("prompt-text").textContent = TYPING_MSGS[seed % TYPING_MSGS.length];
+
+  const next = await fetchNextPromptWithFallback();
+  state.pendingPrompt = next;
+  renderPrompt();
+}
+
+async function fetchNextPromptWithFallback() {
+  const usedSenders = state.history.map(h => h.sender);
+  // Dedupe against the pending prompt's sender too, just in case.
+  const minDelay = new Promise(r => setTimeout(r, 500));
+  try {
+    const [p] = await Promise.all([
+      fetchNextPromptAI(state.history, state.step, usedSenders),
+      minDelay,
+    ]);
+    return p;
+  } catch (_) {
+    // Offline path: pick a fallback prompt that hasn't been used yet.
+    await minDelay;
+    const remaining = FALLBACK_PROMPTS.filter(p => !usedSenders.includes(p.sender));
+    const pool = remaining.length ? remaining : FALLBACK_PROMPTS;
+    const seed = hash(state.history.map(h => h.reply).join("|") + state.step);
+    return pool[seed % pool.length];
   }
 }
 
 async function finishQuiz() {
   showScreen("loading");
-  const seed = hash(state.replies.join("|"));
+  const seed = hash(state.history.map(h => h.reply).join("|"));
   $("loading-copy").textContent = LOADING_MSGS[seed % LOADING_MSGS.length];
 
   // Run AI call and a minimum-loading-time timer in parallel so the
@@ -416,14 +572,15 @@ async function finishQuiz() {
   const minDelay = new Promise(r => setTimeout(r, 1200));
   let result;
   try {
-    const aiPromise = pickArchetypeAI(state.replies);
+    const aiPromise = pickArchetypeAI(state.history);
     const [aiResult] = await Promise.all([aiPromise, minDelay]);
     result = { name: aiResult.name, tag: aiResult.tag, tells: aiResult.tells };
   } catch (_) {
     // Deterministic offline fallback — keeps the app working if the proxy
     // is rate-limited, capped, or down.
     await minDelay;
-    const local = pickArchetypeLocal(state.replies);
+    const replies = state.history.map(h => h.reply);
+    const local = pickArchetypeLocal(replies);
     result = {
       name: local.archetype.name,
       tag: local.archetype.tag,
@@ -439,17 +596,17 @@ function renderResult(result) {
 
   const thread = $("result-thread");
   thread.innerHTML = "";
-  PROMPTS.forEach((p, i) => {
+  state.history.forEach((h) => {
     const incoming = document.createElement("div");
     incoming.className = "bubble incoming";
     incoming.innerHTML =
-      `<span class="sender-name">${escapeHtml(p.sender)}</span>` +
-      `<span class="bubble-text">${escapeHtml(p.text)}</span>`;
+      `<span class="sender-name">${escapeHtml(h.sender)}</span>` +
+      `<span class="bubble-text">${escapeHtml(h.text)}</span>`;
     thread.appendChild(incoming);
 
     const outgoing = document.createElement("div");
     outgoing.className = "bubble outgoing";
-    outgoing.textContent = state.replies[i];
+    outgoing.textContent = h.reply;
     thread.appendChild(outgoing);
   });
 
@@ -476,7 +633,8 @@ function escapeHtml(s) {
 
 function retry() {
   state.step = 0;
-  state.replies = [];
+  state.history = [];
+  state.pendingPrompt = null;
   showScreen("intro");
 }
 
