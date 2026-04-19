@@ -1,4 +1,10 @@
 // Texting Decoder — reply to six texts, get your archetype.
+// Uses the shared ef-ai-proxy to actually read the user's replies and
+// decide on (or invent) a fitting archetype + tells. Deterministic-ish
+// via temperature 0; falls back to a local heuristic if the proxy fails.
+
+const AI_ENDPOINT = 'https://uy3l6suz07.execute-api.us-east-1.amazonaws.com/ai';
+const SLUG = 'texting-decoder';
 
 const PROMPTS = [
   { sender: "someone you half-know",       text: "hey wyd" },
@@ -18,6 +24,9 @@ const LOADING_MSGS = [
   "auditing your 'lol' placement…",
   "waiting for read receipts from the cosmos…",
 ];
+
+// Archetype library — given to the AI as candidates, but it can also invent
+// a new one if none fits. Also used by the offline fallback path.
 
 // ---- archetype catalog (signature archetypes — every one is a label a user would own) ----
 
@@ -203,19 +212,89 @@ function aggregate(replies) {
   };
 }
 
-function pickArchetype(replies) {
+function pickArchetypeLocal(replies) {
+  // Deterministic offline fallback — used only if the AI call fails.
   const f = aggregate(replies);
   const scored = ARCHETYPES.map(a => ({ a, s: a.score(f) }));
   scored.sort((x, y) => y.s - x.s);
   const seed = hash(replies.join("|"));
 
   if (scored[0].s >= 3) {
-    // Deterministic tie-break on near-equal top scores.
     const topS = scored[0].s;
     const tied = scored.filter(x => topS - x.s < 0.4);
     return { archetype: tied[seed % tied.length].a, features: f, score: topS };
   }
   return { archetype: FALLBACK_ARCHETYPES[seed % FALLBACK_ARCHETYPES.length], features: f, score: 0 };
+}
+
+// ---- AI-backed archetype reader ----
+
+function buildAIMessages(replies) {
+  const candidates = ARCHETYPES.map(a => `- ${a.name}: ${a.tag}`).join("\n");
+  const repliesBlock = PROMPTS.map((p, i) =>
+    `${i + 1}. From "${p.sender}" (text: "${p.text}")\n   Reply: ${JSON.stringify(replies[i] || "")}`
+  ).join("\n");
+
+  const system =
+    `You are the Texting Decoder — a sharp, dry-witted analyst who reads what someone's text replies reveal about their thumbs, vibe, and emotional handwriting. ` +
+    `You produce ONE short, punchy texting archetype based on the user's six actual replies. ` +
+    `You must pay close attention to: capitalization, punctuation, ellipses, emoji, abbreviations, sentence length, tone, sincerity, deflection, who the recipient is, and any patterns across the six replies. ` +
+    `\n\nYou MUST respond with strict JSON only — no markdown, no commentary, no preamble. Schema:\n` +
+    `{\n` +
+    `  "name": string,        // 2–5 words, Title Case, like "The Lowercase Romantic" or "Captain Capslock". Punchy. Ownable. Worthy of being someone's identity for the day.\n` +
+    `  "tag":  string,        // ONE sentence (max ~22 words), all-lowercase or sentence case, in our voice. No emojis. No hashtags. No "you are" framing — write it as a description of the archetype itself.\n` +
+    `  "tells": string[]      // 3 or 4 sharp observations grounded in the actual replies. Each ≤ 18 words. Each one should reference a concrete pattern (a specific reply, a count, a habit). No vague horoscope filler. No emojis. No hashtags.\n` +
+    `}\n\n` +
+    `Voice rules: confident, observational, slightly mean in a fond way, like a friend roasting your group chat. Never therapy-speak. Never "great choice!" energy. Never ask follow-up questions. Never explain your reasoning outside the JSON.\n\n` +
+    `Archetype selection: prefer one of the listed candidates if it genuinely fits. If none fit well, invent a new archetype in the same style ("The ___ ___" or "Captain ___" or "The ___ Poet"). Do not just default to a generic option — match the actual evidence.\n\n` +
+    `Candidate archetypes (use one of these names verbatim if it fits, or invent a new one):\n${candidates}`;
+
+  const user =
+    `Here are my six replies, in order. Read all six together — patterns matter more than any single reply.\n\n` +
+    `${repliesBlock}\n\n` +
+    `Return only the JSON object. No prose around it.`;
+
+  return [
+    { role: 'system', content: system },
+    { role: 'user',   content: user },
+  ];
+}
+
+function sanitizeAIResult(parsed) {
+  if (!parsed || typeof parsed !== 'object') return null;
+  const name = typeof parsed.name === 'string' ? parsed.name.trim() : '';
+  const tag  = typeof parsed.tag  === 'string' ? parsed.tag.trim()  : '';
+  let tells = Array.isArray(parsed.tells) ? parsed.tells : [];
+  tells = tells
+    .filter(t => typeof t === 'string')
+    .map(t => t.trim())
+    .filter(Boolean)
+    .slice(0, 4);
+  if (!name || !tag || tells.length < 2) return null;
+  return { name, tag, tells };
+}
+
+async function pickArchetypeAI(replies) {
+  const messages = buildAIMessages(replies);
+  const res = await fetch(AI_ENDPOINT, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      slug: SLUG,
+      messages,
+      max_tokens: 400,
+      temperature: 0,
+      response_format: 'json_object',
+    }),
+  });
+  if (!res.ok) throw new Error('http_' + res.status);
+  const data = await res.json();
+  const raw = (data && data.content) || '';
+  let parsed;
+  try { parsed = JSON.parse(raw); } catch (_) { parsed = null; }
+  const clean = sanitizeAIResult(parsed);
+  if (!clean) throw new Error('bad_ai_payload');
+  return clean;
 }
 
 // ---- tells ----
@@ -327,17 +406,36 @@ function submitReply(e) {
   }
 }
 
-function finishQuiz() {
+async function finishQuiz() {
   showScreen("loading");
   const seed = hash(state.replies.join("|"));
   $("loading-copy").textContent = LOADING_MSGS[seed % LOADING_MSGS.length];
-  setTimeout(renderResult, 1500);
+
+  // Run AI call and a minimum-loading-time timer in parallel so the
+  // typing-bubble never flashes by too fast.
+  const minDelay = new Promise(r => setTimeout(r, 1200));
+  let result;
+  try {
+    const aiPromise = pickArchetypeAI(state.replies);
+    const [aiResult] = await Promise.all([aiPromise, minDelay]);
+    result = { name: aiResult.name, tag: aiResult.tag, tells: aiResult.tells };
+  } catch (_) {
+    // Deterministic offline fallback — keeps the app working if the proxy
+    // is rate-limited, capped, or down.
+    await minDelay;
+    const local = pickArchetypeLocal(state.replies);
+    result = {
+      name: local.archetype.name,
+      tag: local.archetype.tag,
+      tells: buildTells(local.features),
+    };
+  }
+  renderResult(result);
 }
 
-function renderResult() {
-  const { archetype, features } = pickArchetype(state.replies);
-  $("archetype-name").textContent = archetype.name;
-  $("archetype-tag").textContent = archetype.tag;
+function renderResult(result) {
+  $("archetype-name").textContent = result.name;
+  $("archetype-tag").textContent = result.tag;
 
   const thread = $("result-thread");
   thread.innerHTML = "";
@@ -362,7 +460,7 @@ function renderResult() {
   header.textContent = "the tells";
   header.style.cssText = "margin:0 0 10px;font-size:12px;letter-spacing:0.18em;text-transform:uppercase;color:var(--muted);font-weight:700;";
   tellsEl.appendChild(header);
-  buildTells(features).forEach(t => {
+  (result.tells || []).slice(0, 4).forEach(t => {
     const row = document.createElement("div");
     row.className = "tell";
     row.innerHTML = `<span class="tell-marker"></span><span>${escapeHtml(t)}</span>`;
